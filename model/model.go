@@ -34,3 +34,11 @@ type Payment struct {
 	RequestedAt   time.Time `json:"requestedAt"`
 	Processor     int       `json:"processor"`
 }
+
+type ServiceHealthResponse struct {
+	DefaultHealth       bool `json:"defaultHeath"`
+	FallbackHealth      bool `json:"fallbackHealth"`
+	DefaultMinResponse  int  `json:"defaultMinResponse"`
+	FallbackMinResponse int  `json:"fallbackMinResponse"`
+	NextCheck           int  `json:"nextCheck"`
+}

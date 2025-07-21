@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"net/http"
 	"rinha/client"
 	"rinha/model"
 	"rinha/repository"
@@ -9,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mailru/easyjson"
+	"github.com/valyala/fasthttp"
 )
 
 type Handler struct {
@@ -25,16 +25,31 @@ func NewHandler(worker *worker.Worker, repository *repository.Repository, client
 	}
 }
 
-func (h *Handler) HandlePayments(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+func (h *Handler) FasthttpHandler(ctx *fasthttp.RequestCtx) {
+	switch string(ctx.Path()) {
+	case "/payments":
+		h.HandlePayments(ctx)
+	case "/payments-summary":
+		h.HandleSummaryNormal(ctx)
+	case "/payments-summary-single":
+		h.HandleSummarySingle(ctx)
+	case "/purge-payments":
+		h.HandlePurge(ctx)
+	default:
+		ctx.Error("Unsupported path", fasthttp.StatusNotFound)
+	}
+}
+
+func (h *Handler) HandlePayments(ctx *fasthttp.RequestCtx) {
+	if !ctx.IsPost() {
+		ctx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
 		return
 	}
 
 	var req model.PaymentRequest
-	err := easyjson.UnmarshalFromReader(r.Body, &req)
+	err := easyjson.Unmarshal(ctx.PostBody(), &req)
 	if err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+		ctx.Error("Bad Request", fasthttp.StatusBadRequest)
 		return
 	}
 
@@ -48,20 +63,24 @@ func (h *Handler) HandlePayments(w http.ResponseWriter, r *http.Request) {
 		h.Worker.Jobs <- event
 	}()
 
-	w.WriteHeader(http.StatusCreated)
+	ctx.SetStatusCode(fasthttp.StatusCreated)
 }
 
-func (h *Handler) HandleSummaryNormal(w http.ResponseWriter, r *http.Request) {
-	h.HandleSummary(w, r, true)
+func (h *Handler) HandleSummaryNormal(ctx *fasthttp.RequestCtx) {
+	h.HandleSummary(ctx, true)
 }
 
-func (h *Handler) HandleSummarySingle(w http.ResponseWriter, r *http.Request) {
-	h.HandleSummary(w, r, false)
+func (h *Handler) HandleSummarySingle(ctx *fasthttp.RequestCtx) {
+	h.HandleSummary(ctx, false)
 }
 
-func (h *Handler) HandleSummary(w http.ResponseWriter, r *http.Request, checkOther bool) {
-	fromStr := r.URL.Query().Get("from")
-	toStr := r.URL.Query().Get("to")
+func (h *Handler) HandleSummary(ctx *fasthttp.RequestCtx, checkOther bool) {
+	if !ctx.IsGet() {
+		ctx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
+		return
+	}
+	fromStr := string(ctx.QueryArgs().Peek("from"))
+	toStr := string(ctx.QueryArgs().Peek("to"))
 
 	from, err1 := time.Parse(time.RFC3339Nano, fromStr)
 	if err1 != nil {
@@ -82,18 +101,17 @@ func (h *Handler) HandleSummary(w http.ResponseWriter, r *http.Request, checkOth
 		localSummary.Fallback.TotalAmount += otherSummary.Fallback.TotalAmount
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_, _, err := easyjson.MarshalToHTTPResponseWriter(&localSummary, w)
-	if err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	ctx.Response.Header.Set("Content-Type", "application/json")
+	if _, err := easyjson.MarshalToWriter(&localSummary, ctx); err != nil {
+		ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
 	}
 }
 
-func (h *Handler) HandlePurge(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+func (h *Handler) HandlePurge(ctx *fasthttp.RequestCtx) {
+	if !ctx.IsPost() {
+		ctx.Error("Method Not Allowed", fasthttp.StatusMethodNotAllowed)
 		return
 	}
 	h.Repository.PurgePayments()
-	w.WriteHeader(http.StatusAccepted)
+	ctx.SetStatusCode(fasthttp.StatusAccepted)
 }

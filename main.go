@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"rinha/client"
@@ -14,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
 func readEnv(envName string, defaultValue string) string {
@@ -31,36 +32,32 @@ func main() {
 	port := readEnv("SERVER_PORT", "9999")
 	defaultUrl := readEnv("DEFAULT_URL", "http://localhost:8001")
 	fallbackUrl := readEnv("FALLBACK_URL", "http://localhost:8002")
+	healthUrl := readEnv("HEALTH_URL", "http://localhost:9001")
 	otherBackend := readEnv("OTHER_BACKEND", "")
-	client := client.NewClient(defaultUrl, fallbackUrl, otherBackend)
+	client := client.NewClient(defaultUrl, fallbackUrl, otherBackend, healthUrl)
 	repository := repository.NewRepository()
 	workerContext, workerCancel := context.WithCancel(context.Background())
-	worker := worker.NewWorker(workerContext, &wg, repository, client, 1000, 5000)
+	worker := worker.NewWorker(workerContext, &wg, repository, client, 500, 5000)
 	handler := handler.NewHandler(worker, repository, client)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/payments", handler.HandlePayments)
-	mux.HandleFunc("/payments-summary", handler.HandleSummaryNormal)
-	mux.HandleFunc("/payments-summary-single", handler.HandleSummarySingle)
-	mux.HandleFunc("/purge-payments", handler.HandlePurge)
-	server := &http.Server{
-		Addr:    fmt.Sprintf(":%s", port),
-		Handler: mux,
-	}
 
 	worker.Start()
 
+	server := &fasthttp.Server{
+		Handler: handler.FasthttpHandler,
+	}
+
 	go func() {
 		log.Printf("Listening on port %s", port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(fmt.Sprintf(":%s", port)); err != nil {
 			log.Fatalf("HTTP server error: %v", err)
 		}
 	}()
 	<-ctx.Done()
 	workerCancel()
 	log.Println("Shutdown signal received")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	if err := server.Shutdown(); err != nil {
 		log.Printf("HTTP shutdown error: %v", err)
 	}
 	log.Println("Application closed")

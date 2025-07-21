@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -16,10 +17,11 @@ type Client struct {
 	DefaultUrl   string
 	FallbackUrl  string
 	OtherBackend string
+	HealthUrl    string
 	Client       *http.Client
 }
 
-func NewClient(defaultUrl, fallbackUrl, otherBackend string) *Client {
+func NewClient(defaultUrl, fallbackUrl, otherBackend, healthUrl string) *Client {
 	client := &http.Client{
 		Transport: &http.Transport{
 			MaxIdleConns:        500,
@@ -33,16 +35,42 @@ func NewClient(defaultUrl, fallbackUrl, otherBackend string) *Client {
 		},
 		Timeout: 10 * time.Second,
 	}
-	return &Client{DefaultUrl: defaultUrl, FallbackUrl: fallbackUrl, Client: client, OtherBackend: otherBackend}
+	return &Client{
+		DefaultUrl:   defaultUrl,
+		FallbackUrl:  fallbackUrl,
+		Client:       client,
+		OtherBackend: otherBackend,
+		HealthUrl:    healthUrl,
+	}
 }
 
 // SendPayment tries default first, then fallback
-func (c *Client) SendPayment(event model.PaymentEvent) (int, error) {
-	if c.PostJSON(c.DefaultUrl, event) {
-		return 0, nil
-	}
-	if c.PostJSON(c.FallbackUrl, event) {
-		return 1, nil
+func (c *Client) SendPayment(event model.PaymentEvent, serviceHealth model.ServiceHealthResponse) (int, error) {
+	if serviceHealth.DefaultHealth && serviceHealth.FallbackHealth {
+		firstUrl := c.DefaultUrl
+		secondUrl := c.FallbackUrl
+		firstProcessor := 0
+		secondProcessor := 1
+		if serviceHealth.FallbackMinResponse < serviceHealth.DefaultMinResponse {
+			secondUrl = c.DefaultUrl
+			firstProcessor = 1
+			firstUrl = c.FallbackUrl
+			secondProcessor = 0
+		}
+		if c.PostJSON(firstUrl, event) {
+			return firstProcessor, nil
+		}
+		if c.PostJSON(secondUrl, event) {
+			return secondProcessor, nil
+		}
+	} else if serviceHealth.DefaultHealth {
+		if c.PostJSON(c.DefaultUrl, event) {
+			return 0, nil
+		}
+	} else if serviceHealth.FallbackHealth {
+		if c.PostJSON(c.FallbackUrl, event) {
+			return 1, nil
+		}
 	}
 	return -1, ErrBothFailed
 }
@@ -82,29 +110,24 @@ func (c *Client) PostJSON(url string, event model.PaymentEvent) bool {
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
-func (c *Client) DefaultHealth() (bool, int) {
-	return c.ServiceHealth(c.DefaultUrl)
-}
-
-func (c *Client) FallbackHealth() (bool, int) {
-	return c.ServiceHealth(c.FallbackUrl)
-}
-
-func (c *Client) ServiceHealth(url string) (bool, int) {
-	resp, err := c.Client.Get(fmt.Sprintf("%s/payments/service-health/", url))
+func (c *Client) ServiceHealth() (model.ServiceHealthResponse, error) {
+	resp, err := c.Client.Get(fmt.Sprintf("%s/health", c.HealthUrl))
 	if err != nil {
 		log.Printf("Service health error: %v", err)
-		return true, 0
+		return model.ServiceHealthResponse{}, err
 	}
 	defer resp.Body.Close()
 
-	var data model.ProcessorHealthResponse
-	err = easyjson.UnmarshalFromReader(resp.Body, &data)
-	if err != nil {
-		return true, 0
+	if resp.StatusCode == 200 {
+		var serviceHealthResponse model.ServiceHealthResponse
+		err = easyjson.UnmarshalFromReader(resp.Body, &serviceHealthResponse)
+		if err != nil {
+			return model.ServiceHealthResponse{}, err
+		}
+		return serviceHealthResponse, nil
 	}
-	log.Printf("Checking service health %s: %v", url, data)
-	return data.Failing, data.MinResponseTime
+	return model.ServiceHealthResponse{}, errors.New("invalid service health response")
+
 }
 
 func (c *Client) GetSummarySingle(from, to string) *model.SummaryResponse {

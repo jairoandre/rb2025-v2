@@ -11,15 +11,17 @@ import (
 )
 
 type Worker struct {
-	Jobs         chan model.PaymentEvent
-	PriorityJobs chan model.PaymentEvent
-	Wg           *sync.WaitGroup
-	NumWorkers   int
-	Ctx          context.Context
-	Repository   *repository.Repository
-	Client       *client.Client
-	Suspended    bool
-	SuspendedMux sync.Mutex
+	Jobs          chan model.PaymentEvent
+	PriorityJobs  chan model.PaymentEvent
+	Wg            *sync.WaitGroup
+	NumWorkers    int
+	Ctx           context.Context
+	Repository    *repository.Repository
+	Client        *client.Client
+	suspendCh     chan struct{}
+	suspended     bool
+	suspendedMux  sync.Mutex
+	serviceHealth model.ServiceHealthResponse
 }
 
 func NewWorker(
@@ -30,6 +32,7 @@ func NewWorker(
 	numWorkers, bufferSize int) *Worker {
 	jobs := make(chan model.PaymentEvent, bufferSize)
 	priorityJobs := make(chan model.PaymentEvent, bufferSize)
+	suspendCh := make(chan struct{})
 	return &Worker{
 		Ctx:          ctx,
 		Wg:           wg,
@@ -37,17 +40,47 @@ func NewWorker(
 		Repository:   repository,
 		Client:       processor,
 		Jobs:         jobs,
-		PriorityJobs: priorityJobs}
+		PriorityJobs: priorityJobs,
+		suspendCh:    suspendCh}
 }
 
 func (w *Worker) SuspendJobs() {
-	w.SuspendedMux.Lock()
+	log.Println("Suspend job")
+	w.suspendedMux.Lock()
+	if w.suspended {
+		log.Println("Skip supended")
+		w.suspendedMux.Unlock()
+		return
+	} else {
+		w.suspended = true
+	}
+	w.suspendedMux.Unlock()
+	go func() {
+		for {
+			if w.serviceHealth.DefaultHealth || w.serviceHealth.FallbackHealth {
+				w.ResumeJobs()
+				return
+			}
+			time.Sleep(time.Duration(w.serviceHealth.NextCheck) * time.Millisecond)
+		}
+	}()
+}
 
+func (w *Worker) ResumeJobs() {
+	log.Println("Resume job")
+	w.suspendedMux.Lock()
+	w.suspended = false
+	w.suspendedMux.Unlock()
+	close(w.suspendCh)
+	w.suspendCh = make(chan struct{})
 }
 
 func (w *Worker) HandleEvent(event model.PaymentEvent) {
-	processor, err := w.Client.SendPayment(event)
+	processor, err := w.Client.SendPayment(event, w.serviceHealth)
 	if err != nil {
+		if !w.suspended {
+			w.SuspendJobs()
+		}
 		w.PriorityJobs <- event
 		return
 	}
@@ -62,6 +95,14 @@ func (w *Worker) HandleEvent(event model.PaymentEvent) {
 func (w *Worker) HandleJob(ctx context.Context) {
 	defer w.Wg.Done()
 	for {
+		w.suspendedMux.Lock()
+		suspended := w.suspended
+		ch := w.suspendCh
+		w.suspendedMux.Unlock()
+		if suspended {
+			<-ch
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -75,13 +116,31 @@ func (w *Worker) HandleJob(ctx context.Context) {
 
 func (w *Worker) Start() {
 	log.Println("Preparing workers")
-	ctxWithCancel, cancelJobs := context.WithCancel(w.Ctx)
+	ctx, cancelJobs := context.WithCancel(w.Ctx)
 	for range w.NumWorkers {
 		w.Wg.Add(1)
-		go w.HandleJob(ctxWithCancel)
+		go w.HandleJob(ctx)
 	}
 	go func() {
 		<-w.Ctx.Done()
 		cancelJobs()
+	}()
+	go func() {
+		log.Println("Starting service health monitor")
+		for {
+			select {
+			case <-w.Ctx.Done():
+				log.Println("Stop service health monitor")
+				return
+			default:
+				serviceHealth, err := w.Client.ServiceHealth()
+				if err != nil {
+					log.Println("Error retrieving service health")
+				} else {
+					w.serviceHealth = serviceHealth
+					time.Sleep(time.Duration(serviceHealth.NextCheck) * time.Millisecond)
+				}
+			}
+		}
 	}()
 }
